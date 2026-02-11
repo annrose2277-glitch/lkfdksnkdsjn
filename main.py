@@ -21,7 +21,7 @@ def main():
     """
     Main function to run the real-time assistive object detection.
     """
-    print("Initializing YOLOv8n model...")
+    print("Initializing YOLO26n model...")
     # Initialize the YOLOv8-Nano model, chosen for its high speed.
     # The model is initialized only once, outside the main loop, for optimization.
     try:
