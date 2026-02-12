@@ -1,155 +1,165 @@
-
 import cv2
 import time
+import pyttsx3
+import threading
 from ultralytics import YOLO
 import numpy as np
 
 # --- Constants and Configuration ---
-# The model will identify an object as "close" if its bounding box
-# covers at least this much of the total frame area.
+
+# An object is a "warning" if it covers at least this much of the screen.
 PROXIMITY_THRESHOLD = 0.40
 
-# How long the textual identification message should stay on screen (in seconds).
+# Time in seconds for the audio warning interval.
+WARNING_INTERVAL = 5
+
+# How long the visual warning label stays on screen.
 DISPLAY_DURATION = 5
 
-# Confidence threshold for object detection. Detections below this are ignored.
+# Confidence threshold for object detection.
 CONFIDENCE_THRESHOLD = 0.5
+
+# --- TTS Engine Setup ---
+
+def speak(engine, text):
+    """Function to run TTS in a separate thread to prevent video lag."""
+    engine.say(text)
+    engine.runAndWait()
+
+# Initialize the TTS engine
+try:
+    tts_engine = pyttsx3.init()
+except Exception as e:
+    print(f"Warning: Could not initialize pyttsx3 TTS engine: {e}")
+    tts_engine = None
+
 
 # --- Main Script ---
 
 def main():
     """
-    Main function to run the real-time assistive object detection.
+    Main function to run the real-time assistive object detection with audio feedback.
     """
-    print("Initializing YOLO26n model...")
-    # Initialize the YOLOv8-Nano model, chosen for its high speed.
-    # The model is initialized only once, outside the main loop, for optimization.
+    print("Initializing YOLO model...")
     try:
         model = YOLO("yolo26n.pt")
     except Exception as e:
         print(f"Error initializing YOLO model: {e}")
-        print("Please ensure you have run 'pip install ultralytics' and that the model file is accessible.")
+        print("Please ensure you have run 'pip install ultralytics pyttsx3' and that 'yolo26n.pt' is accessible.")
         return
 
     print("Starting webcam...")
-    # Use cv2.VideoCapture(0) to access the default webcam.
     cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # Gracefully handle cases where the webcam is not available.
     if not cap.isOpened():
         print("Error: Could not open webcam.")
         return
 
-    # Get webcam frame dimensions for area calculations.
+    # Get frame dimensions for proximity calculation.
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_area = frame_width * frame_height
 
     # --- State Management Variables ---
-    # These variables manage the display of the centered text message.
-    current_message = None
-    message_start_time = 0
+    last_warning_time = 0
+    current_warning_object = None # Stores info about the object to be displayed
+    warning_display_start_time = 0
 
     print("Starting detection loop... Press 'q' to quit.")
     while True:
-        # Read a frame from the webcam.
         success, frame = cap.read()
         if not success:
             print("Error: Failed to grab frame.")
             break
 
+        # "Selfie" Mode: Flip the frame horizontally.
+        processed_frame = cv2.flip(frame, 1)
+
         # --- YOLO Detection ---
-        # Run the model on the current frame.
-        # stream=True is efficient for video feeds.
-        # verbose=False reduces console spam for a cleaner output.
         results = model.predict(
-            frame,
+            processed_frame,
             stream=True,
             verbose=False,
             conf=CONFIDENCE_THRESHOLD
         )
 
-        # Variable to track the most dominant "close" object in the current frame.
-        dominant_object_found = None
+        # --- Proximity and Warning Logic ---
+        dominant_object_in_frame = None
         max_dominant_area = 0
 
-        # Process the results from the model.
         for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                # --- Bounding Box Processing ---
-                # Get coordinates, class, and confidence.
-                x1, y1, x2, y2 = box.xyxy[0]
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                cls_id = int(box.cls[0])
-                class_name = model.names[cls_id]
-                
-                # --- Proximity Calculation ---
-                box_width = x2 - x1
-                box_height = y2 - y1
-                box_area = box_width * box_height
-                
-                # The "40% coverage calculation":
-                # We determine how much of the screen the object occupies by dividing
-                # the object's bounding box area by the total frame area.
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                class_name = model.names[int(box.cls[0])]
+
+                # Calculate screen coverage.
+                box_area = (x2 - x1) * (y2 - y1)
                 coverage_ratio = box_area / frame_area
 
-                # Draw the standard bounding box for every detected object.
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
-                label = f"{class_name} {box.conf[0]:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-
-                # --- "Close/Dominant" Object Logic ---
-                # Check if the object is close enough AND is the most dominant one so far.
+                # Draw standard boxes for all detected objects.
+                cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+                
+                # Check if object meets the proximity threshold to be a "warning".
                 if coverage_ratio >= PROXIMITY_THRESHOLD:
+                    # If it's the largest warning object found so far in this frame, store it.
                     if box_area > max_dominant_area:
                         max_dominant_area = box_area
-                        dominant_object_found = class_name
+                        dominant_object_in_frame = {"name": class_name, "box": (x1, y1, x2, y2)}
 
-        # If a dominant object was found in this frame, update the message state.
-        if dominant_object_found:
-            current_message = dominant_object_found
-            message_start_time = time.time()
+        current_time = time.time()
+        
+        # If a dominant warning object was found, update the global state.
+        if dominant_object_in_frame:
+            current_warning_object = dominant_object_in_frame
+            warning_display_start_time = current_time # Reset display timer
 
-        # --- "5-Second" Timer and Display Logic ---
-        # Check if a message should be actively displayed.
-        if current_message and (time.time() - message_start_time) < DISPLAY_DURATION:
-            # --- Visuals: Centered Text Overlay ---
-            font = cv2.FONT_HERSHEY_DUPLEX
-            font_scale = 2
-            thickness = 3
-            text_size = cv2.getTextSize(current_message, font, font_scale, thickness)[0]
-            
-            # Calculate position to center the text
-            text_x = (frame_width - text_size[0]) // 2
-            text_y = (frame_height + text_size[1]) // 2
+            # --- Audio Warning Trigger ---
+            # If enough time has passed since the last warning, issue a new one.
+            if (current_time - last_warning_time) > WARNING_INTERVAL:
+                last_warning_time = current_time
+                message = f"Warning, {current_warning_object['name']} is close"
+                print(message) # Print to terminal
+                if tts_engine:
+                    threading.Thread(target=speak, args=(tts_engine, message)).start()
+        
+        # --- Visual Warning Label Display ---
+        # If there is an active warning object and its display timer has not expired.
+        if current_warning_object and (current_time - warning_display_start_time) < DISPLAY_DURATION:
+            # --- Label Styling ---
+            bx1, by1, bx2, by2 = current_warning_object["box"]
+            class_name = current_warning_object["name"]
 
-            # Create a black background rectangle for better readability.
-            bg_x1 = text_x - 20
-            bg_y1 = text_y - text_size[1] - 20
-            bg_x2 = text_x + text_size[0] + 20
-            bg_y2 = text_y + 20
+            font_face = cv2.FONT_HERSHEY_DUPLEX
+            font_scale = 1.2
+            thickness = 2
+            text_color = (255, 255, 255) # White
+            bg_color = (0, 0, 0)         # Black
+
+            (text_w, text_h), baseline = cv2.getTextSize(class_name, font_face, font_scale, thickness)
             
-            cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
+            label_x, label_y = bx1, by2 
             
-            # Draw the white text on top of the black background.
-            cv2.putText(frame, current_message, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+            bg_x1, bg_y1 = label_x, label_y - text_h - baseline
+            bg_x2, bg_y2 = label_x + text_w, label_y + baseline
+            
+            cv2.rectangle(processed_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), bg_color, -1)
+            cv2.putText(processed_frame, class_name, (label_x, label_y), font_face, font_scale, text_color, thickness)
         else:
-            # If the timer has expired, clear the message.
-            current_message = None
-            
-        # Display the processed frame.
-        cv2.imshow("Assistive Object Detection", frame)
+            # Clear the warning if the timer has expired.
+            current_warning_object = None
 
-        # Break the loop if the 'q' key is pressed.
+        cv2.imshow("Assistive Object Detection", processed_frame)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     # --- Cleanup ---
-    # Release the webcam and destroy all OpenCV windows.
     cap.release()
     cv2.destroyAllWindows()
     print("Script finished.")
 
 if __name__ == "__main__":
     main()
+
