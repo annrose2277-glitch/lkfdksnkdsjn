@@ -10,21 +10,22 @@ import numpy as np
 # An object is a "warning" if it covers at least this much of the screen.
 PROXIMITY_THRESHOLD = 0.40
 
-# Time in seconds for the audio warning interval.
-WARNING_INTERVAL = 5
-
-# How long the visual warning label stays on screen.
-DISPLAY_DURATION = 5
 
 # Confidence threshold for object detection.
 CONFIDENCE_THRESHOLD = 0.5
 
 # --- TTS Engine Setup ---
+tts_busy = False
 
 def speak(engine, text):
     """Function to run TTS in a separate thread to prevent video lag."""
-    engine.say(text)
-    engine.runAndWait()
+    global tts_busy
+    tts_busy = True
+    try:
+        engine.say(text)
+        engine.runAndWait()
+    finally:
+        tts_busy = False
 
 # Initialize the TTS engine
 try:
@@ -62,10 +63,6 @@ def main():
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_area = frame_width * frame_height
 
-    # --- State Management Variables ---
-    last_warning_time = 0
-    current_warning_object = None # Stores info about the object to be displayed
-    warning_display_start_time = 0
 
     print("Starting detection loop... Press 'q' to quit.")
     while True:
@@ -110,56 +107,32 @@ def main():
                 
                 # Draw the bounding box with the determined color
                 cv2.rectangle(processed_frame, (x1, y1), (x2, y2), box_color, 2)
+
+                # --- Draw Label on EVERY Bounding Box ---
+                label = f"{class_name}"
                 
-                # Check if object meets the proximity threshold to be a "warning".
-                if coverage_ratio >= PROXIMITY_THRESHOLD:
-                    # If it's the largest warning object found so far in this frame, store it.
-                    if box_area > max_dominant_area:
-                        max_dominant_area = box_area
-                        dominant_object_in_frame = {"name": class_name, "box": (x1, y1, x2, y2)}
+                # Get text size to create a background for the label
+                (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                
+                # Position for the background rectangle
+                label_bg_y1 = y1 - text_h - 10
+                # If the label would go off the top of the screen, place it inside the box instead
+                if label_bg_y1 < 0:
+                    label_bg_y1 = y1 + 2
 
-        current_time = time.time()
-        
-        # If a dominant warning object was found, update the global state.
+                # Draw background rectangle
+                cv2.rectangle(processed_frame, (x1, label_bg_y1), (x1 + text_w, label_bg_y1 + text_h + baseline), box_color, -1)
+                # Draw text label
+                cv2.putText(processed_frame, label, (x1, label_bg_y1 + text_h), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        # If a dominant warning object was found, trigger an audio warning.
         if dominant_object_in_frame:
-            current_warning_object = dominant_object_in_frame
-            warning_display_start_time = current_time # Reset display timer
-
-            # --- Audio Warning Trigger ---
-            # If enough time has passed since the last warning, issue a new one.
-            if (current_time - last_warning_time) > WARNING_INTERVAL:
-                last_warning_time = current_time
-                message = f"Warning, {current_warning_object['name']} is close"
+            # If the TTS engine is not busy, issue a new warning.
+            if not tts_busy:
+                message = f"Warning, {dominant_object_in_frame['name']} is close"
                 print(message) # Print to terminal
                 if tts_engine:
                     threading.Thread(target=speak, args=(tts_engine, message)).start()
-        
-        # --- Visual Warning Label Display ---
-        # If there is an active warning object and its display timer has not expired.
-        if current_warning_object and (current_time - warning_display_start_time) < DISPLAY_DURATION:
-            # --- Label Styling ---
-            bx1, by1, bx2, by2 = current_warning_object["box"]
-            class_name = current_warning_object["name"]
-
-            font_face = cv2.FONT_HERSHEY_DUPLEX
-            font_scale = 1.2
-            thickness = 2
-            text_color = (255, 255, 255) # White
-            bg_color = (0, 0, 0)         # Black
-
-            (text_w, text_h), baseline = cv2.getTextSize(class_name, font_face, font_scale, thickness)
-            
-            label_x, label_y = bx1, by2 
-            
-            bg_x1, bg_y1 = label_x, label_y - text_h - baseline
-            bg_x2, bg_y2 = label_x + text_w, label_y + baseline
-            
-            cv2.rectangle(processed_frame, (bg_x1, bg_y1), (bg_x2, bg_y2), bg_color, -1)
-            cv2.putText(processed_frame, class_name, (label_x, label_y), font_face, font_scale, text_color, thickness)
-        else:
-            # Clear the warning if the timer has expired.
-            current_warning_object = None
-
 
         cv2.imshow("Assistive Object Detection", processed_frame)
 
